@@ -1,0 +1,329 @@
+*&---------------------------------------------------------------*
+*& Report Custom Purchase Requisition & Balance PR PO
+*&---------------------------------------------------------------*
+*& Module      : MM
+*& Developer   : Yohana BXXXXXX C
+*& Internal IT XXXXXXXXXXXXXXXX
+*&---------------------------------------------------------------*
+*& REVISION LOG
+*&
+*& DATE         DEV                 CORRECTION                  DESCRIPTION
+*& ----         ------                                          -----------
+*& 20251104     Yohana BXXXXXX     N/A                         Initial Development
+*& 20251117     Yohana BXXXXXX     Rev.01                      Change balance PR PO qty to round 0.00 & add UoM PR
+*&
+*&---------------------------------------------------------------*
+REPORT zprr0001 NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+*-----------------------------------------------------------------------
+* TYPE-POOLS & DECLARATIONS
+*-----------------------------------------------------------------------
+TYPE-POOLS: slis.
+
+TYPES: BEGIN OF ty_pr,
+         banfn TYPE eban-banfn,   "PR Number
+         bnfpo TYPE eban-bnfpo,   "PR Item
+         ebeln TYPE ekpo-ebeln,   "PO Number
+         ebelp TYPE ekpo-ebelp,   "PO Item
+         qty_po TYPE ekpo-menge,  "Qty PO per item
+         balqty TYPE eban-menge,  "Balance qty
+         ekgrp TYPE eban-ekgrp,   "Purch Group
+         werks TYPE eban-werks,   "Plant
+         lgort TYPE eban-lgort,   "Storage Loc
+         matnr TYPE eban-matnr,   "Material
+         txz01 TYPE eban-txz01,   "Short Text
+         menge TYPE eban-menge,   "PR Qty
+         meins TYPE ekpo-meins,   "UoM PO
+         meinp TYPE eban-meins,   "UoM PR | Rev.01
+         afnam TYPE eban-afnam,   "Requisitioner
+         frgkz TYPE eban-frgkz,   "Release Indicator
+         statu TYPE eban-statu,   "Processing Status
+         loekz TYPE eban-loekz,   "Deletion Indicator
+         kostl TYPE ebkn-kostl,   "Cost Center
+         sakto TYPE ebkn-sakto,   "G/L Account
+         afdat TYPE eban-badat,   "Requisition Date
+         ernam TYPE eban-ernam,   "Created by
+         pstyp TYPE eban-pstyp,   "Item Category
+         knttp TYPE eban-knttp,   "Acct Assgmt Cat
+         frgst TYPE eban-frgst,   "Rel Strategy
+         lpein TYPE eban-lpein,   "Delv Date
+         matkl TYPE eban-matkl,   "Mat Group
+         erdat TYPE eban-erdat,   "Changed On
+         bsart TYPE eban-bsart,   "Doc Type
+         budat TYPE ekko-bedat,   "PO Doc Date
+       END OF ty_pr.
+
+DATA: gt_pr     TYPE TABLE OF ty_pr,
+      gs_pr     TYPE ty_pr,
+      gt_final  TYPE TABLE OF ty_pr,
+      gs_final  TYPE ty_pr.
+
+" REV. 001 | Variables (declare rounding decfloat)
+DATA: lv_total_po_qty TYPE decfloat34,   "sum of PO qty per PR item
+      lv_pr_qty       TYPE decfloat34,   "PR qty as decfloat
+      lv_raw_bal      TYPE decfloat34,   "raw difference
+      lv_balqty       TYPE decfloat34,   "rounded balance
+      lv_found        TYPE i.
+
+CONSTANTS: lc_tol TYPE decfloat34 VALUE '.005'. "tolerance untuk rounding
+
+*-----------------------------------------------------------------------
+* SELECTION SCREEN
+*-----------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK blk1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_banfn FOR gs_pr-banfn MODIF ID sel,
+                s_ekgrp FOR gs_pr-ekgrp MODIF ID sel,
+                s_bsart FOR gs_pr-bsart MODIF ID sel.
+PARAMETERS: p_werks  TYPE eban-werks OBLIGATORY DEFAULT '1200' MODIF ID sel.
+PARAMETERS: p_delind AS CHECKBOX MODIF ID sel.
+SELECTION-SCREEN END OF BLOCK blk1.
+
+*-----------------------------------------------------------------------
+* START-OF-SELECTION
+*-----------------------------------------------------------------------
+START-OF-SELECTION.
+
+*--- Ambil data PR (EBAN + EBKN)
+  SELECT a~banfn,
+         a~bnfpo,
+         a~ekgrp,
+         a~werks,
+         a~lgort,
+         a~matnr,
+         a~txz01,
+         a~menge,
+         a~meins AS meinp, "Rev.02 - UoM PR
+         a~afnam,
+         a~frgkz,
+         a~statu,
+         a~loekz,
+         b~kostl,
+         b~sakto,
+         a~badat AS afdat,
+         a~ernam,
+         a~pstyp,
+         a~knttp,
+         a~frgst,
+         a~lpein,
+         a~matkl,
+         a~erdat,
+         a~bsart
+    FROM eban AS a
+    LEFT JOIN ebkn AS b
+      ON  b~banfn = a~banfn
+      AND b~bnfpo = a~bnfpo
+    WHERE a~banfn IN @s_banfn
+      AND a~ekgrp IN @s_ekgrp
+      AND a~bsart IN @s_bsart
+      AND a~werks = @p_werks
+      AND ( @p_delind = 'X' OR a~loekz = '' )
+    INTO CORRESPONDING FIELDS OF TABLE @gt_pr.
+
+  IF gt_pr IS INITIAL.
+    MESSAGE 'No PR data found for given selection.' TYPE 'I'.
+    EXIT.
+  ENDIF.
+
+*-----------------------------------------------------------------------
+* Ambil data PO terkait PR, PO item tidak deleted
+*-----------------------------------------------------------------------
+SELECT a~banfn,
+       a~bnfpo,
+       a~ebeln,
+       a~ebelp,
+       a~meins,
+       a~menge AS qty_po,
+       b~bedat AS budat
+  FROM ekpo AS a
+  INNER JOIN ekko AS b
+    ON b~ebeln = a~ebeln
+  WHERE a~banfn IN @s_banfn
+    AND a~loekz = ''
+  INTO TABLE @DATA(gt_po).
+
+*-----------------------------------------------------------------------
+* Merge PR–PO (perhitungan aman: gunakan decfloat34 untuk total & balance)
+*-----------------------------------------------------------------------
+LOOP AT gt_pr INTO gs_pr.
+
+  " reset per PR item
+  lv_total_po_qty = CONV decfloat34( '0' ).
+  lv_pr_qty       = CONV decfloat34( gs_pr-menge ).
+  lv_raw_bal      = CONV decfloat34( '0' ).
+  lv_balqty       = CONV decfloat34( '0' ).
+  lv_found        = 0.
+
+  " 1) hitung total PO qty untuk PR item ini (sum all PO lines), tanpa rounding per baris
+  LOOP AT gt_po INTO DATA(ls_po_sum)
+       WHERE banfn = gs_pr-banfn
+         AND bnfpo = gs_pr-bnfpo.
+    lv_total_po_qty = lv_total_po_qty + CONV decfloat34( ls_po_sum-qty_po ).
+  ENDLOOP.
+
+  " 2) setelah total terkumpul, ROUND total PO ke 2 desimal
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      decimals = 2
+      input    = lv_total_po_qty
+    IMPORTING
+      output   = lv_total_po_qty.
+
+  " juga round PR qty ke 2 desimal (agar basis perhitungan sama)
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      decimals = 2
+      input    = lv_pr_qty
+    IMPORTING
+      output   = lv_pr_qty.
+
+  " 3) tampilkan per PO line (jika ada)
+  LOOP AT gt_po INTO DATA(ls_po)
+       WHERE banfn = gs_pr-banfn
+         AND bnfpo = gs_pr-bnfpo.
+
+    lv_found = 1.
+    CLEAR gs_final.
+    MOVE-CORRESPONDING gs_pr TO gs_final.
+
+    gs_final-ebeln  = ls_po-ebeln.
+    gs_final-ebelp  = ls_po-ebelp.
+    gs_final-qty_po = ls_po-qty_po.
+    gs_final-budat  = ls_po-budat.
+    gs_final-meins  = ls_po-meins.      "Rev.01 | UoM PO
+
+    " hitung balance berdasarkan total (PR rounded - PO total rounded)
+    lv_raw_bal = lv_pr_qty - lv_total_po_qty.
+
+    CALL FUNCTION 'ROUND'
+      EXPORTING
+        decimals = 2
+        input    = lv_raw_bal
+      IMPORTING
+        output   = lv_balqty.
+
+    " tolerance: jika sangat kecil, anggap nol
+    IF abs( lv_balqty ) <= lc_tol.
+      lv_balqty = 0.
+    ENDIF.
+
+    gs_final-balqty = lv_balqty.
+
+    APPEND gs_final TO gt_final.
+  ENDLOOP.
+
+  " 4) jika tidak ada PO -> tampilkan PR-only row
+  IF lv_found = 0.
+    CLEAR gs_final.
+    MOVE-CORRESPONDING gs_pr TO gs_final.
+    gs_final-ebeln  = ''.
+    gs_final-ebelp  = ''.
+    gs_final-qty_po = 0.
+
+    " balance = PR qty rounded (lv_pr_qty sudah di-round)
+    CALL FUNCTION 'ROUND'
+      EXPORTING
+        decimals = 2
+        input    = lv_pr_qty
+      IMPORTING
+        output   = lv_balqty.
+
+    IF abs( lv_balqty ) <= lc_tol.
+      lv_balqty = 0.
+    ENDIF.
+
+    gs_final-balqty = lv_balqty.
+
+    APPEND gs_final TO gt_final.
+  ENDIF.
+
+ENDLOOP.
+
+*-----------------------------------------------------------------------
+* Format Material Number
+*-----------------------------------------------------------------------
+LOOP AT gt_final INTO gs_final.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = gs_final-matnr
+    IMPORTING
+      output = gs_final-matnr.
+  MODIFY gt_final FROM gs_final.
+ENDLOOP.
+
+*-----------------------------------------------------------------------
+* Hapus PR yang sudah full (balance = 0)  -- (opsional)
+*-----------------------------------------------------------------------
+" DELETE gt_final WHERE balqty IS INITIAL.
+
+*-----------------------------------------------------------------------
+* Display ALV
+*-----------------------------------------------------------------------
+DATA: lt_fieldcat TYPE slis_t_fieldcat_alv,
+      ls_fieldcat TYPE slis_fieldcat_alv.
+
+PERFORM build_fieldcat.
+
+READ TABLE lt_fieldcat INTO ls_fieldcat WITH KEY fieldname = 'MENGE'.
+IF sy-subrc = 0.
+  ls_fieldcat-decimals_out = 2.
+  MODIFY lt_fieldcat FROM ls_fieldcat INDEX sy-tabix.
+ENDIF.
+
+READ TABLE lt_fieldcat INTO ls_fieldcat WITH KEY fieldname = 'QTY_PO'.
+IF sy-subrc = 0.
+  ls_fieldcat-decimals_out = 2.
+  MODIFY lt_fieldcat FROM ls_fieldcat INDEX sy-tabix.
+ENDIF.
+
+READ TABLE lt_fieldcat INTO ls_fieldcat WITH KEY fieldname = 'BALQTY'.
+IF sy-subrc = 0.
+  ls_fieldcat-decimals_out = 2.
+  MODIFY lt_fieldcat FROM ls_fieldcat INDEX sy-tabix.
+ENDIF.
+
+CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+  EXPORTING
+    it_fieldcat = lt_fieldcat
+    i_save      = 'A'
+  TABLES
+    t_outtab    = gt_final.
+
+*-----------------------------------------------------------------------
+* FORM build_fieldcat -> executed show
+*-----------------------------------------------------------------------
+FORM build_fieldcat.
+  DEFINE add_field.
+    CLEAR ls_fieldcat.
+    ls_fieldcat-fieldname = &1.
+    ls_fieldcat-seltext_m = &2.
+    APPEND ls_fieldcat TO lt_fieldcat.
+  END-OF-DEFINITION.
+
+  add_field 'LOEKZ'  'Deletion Ind'.
+  add_field 'FRGKZ'  'Rel Ind PR'.
+  add_field 'BANFN'  'Purchase Req No'.
+  add_field 'BNFPO'  'PR Item'.
+  add_field 'BUDAT'  'PO Doc Date'.
+  add_field 'EBELN'  'PO Number'.
+  add_field 'EBELP'  'PO Item'.
+  add_field 'MATNR'  'Material'.
+  add_field 'TXZ01'  'Short Text'.
+  add_field 'MENGE'  'PR Qty'.
+  add_field 'MEINP'  'UoM PR'.
+  add_field 'QTY_PO' 'PO Qty'.
+  add_field 'MEINS'  'UoM PO'.
+  add_field 'BALQTY' 'Balance Qty'.
+  add_field 'EKGRP'  'Purch Group'.
+  add_field 'WERKS'  'Plant'.
+  add_field 'LGORT'  'SLoc'.
+  add_field 'AFNAM'  'Requisitioner'.
+  add_field 'KOSTL'  'Cost Center'.
+  add_field 'SAKTO'  'G/L Account'.
+  add_field 'AFDAT'  'Req. Date'.
+  add_field 'ERNAM'  'Created By'.
+  add_field 'ERDAT'  'Changed On'.
+  add_field 'PSTYP'  'Item Category'.
+  add_field 'KNTTP' 'Acct Assgmt Cat'.
+  add_field 'FRGST' 'Rel Strategy'.
+  add_field 'BSART'  'Doc Type'.
+ENDFORM.
